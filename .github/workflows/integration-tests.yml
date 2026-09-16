@@ -81,11 +81,15 @@ jobs:
   build-node-images:
     needs: [changes, supported-versions]
     if: needs.changes.outputs.node-images == 'true' || inputs.build-node-images == true
-    runs-on: ubuntu-latest
+    # kube-minor and arch are independent axes here (unlike the sibling
+    # bink/cluster/dns workflows, which only vary by arch), so the
+    # runner is picked with an expression rather than a paired `include:`.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
         kube-minor: ${{ fromJson(needs.supported-versions.outputs.all-versions) }}
+        arch: [amd64, arm64]
     permissions:
       contents: read
       packages: write
@@ -93,7 +97,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Only the composefs path below still uses bcvk, which boots a real VM
+      # and needs KVM. The main disk image build uses bootc-image-builder,
+      # which doesn't, so arm64 (no /dev/kvm on ubuntu-24.04-arm) skips this.
       - name: Set up KVM
+        if: matrix.arch == 'amd64'
         run: |
           sudo chmod 666 /dev/kvm
           ls -la /dev/kvm
@@ -110,7 +118,9 @@ jobs:
         working-directory: node-images/fedora
         run: |
           TAG=$(make -s print-image-tag KUBE_MINOR=${{ matrix.kube-minor }})
-          STAGING_TAG=${{ needs.supported-versions.outputs.branch-tag }}-${TAG}
+          # Arch-suffixed so the amd64 and arm64 legs don't clobber each
+          # other's staging tag when pushing concurrently.
+          STAGING_TAG=${{ needs.supported-versions.outputs.branch-tag }}-${TAG}-${{ matrix.arch }}
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "staging-tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
           echo "Image tag: ${TAG} (staging: ${STAGING_TAG})"
@@ -142,8 +152,11 @@ jobs:
         if: github.event_name == 'push' || inputs.push-node-images == true
         run: sudo podman login -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }} ghcr.io
 
+      # amd64-only for now: push-node-images (which consumes this staging
+      # tag) isn't extended to arm64 in this PR, so pushing an arm64 bootc
+      # image here would just be an unconsumed, colliding tag.
       - name: Push bootc image to GHCR (staging)
-        if: github.event_name == 'push' || inputs.push-node-images == true
+        if: matrix.arch == 'amd64' && (github.event_name == 'push' || inputs.push-node-images == true)
         working-directory: node-images/fedora
         run: |
           BOOTC_SRC=$(make -s print-bootc-image KUBE_MINOR=${{ matrix.kube-minor }})
@@ -161,23 +174,33 @@ jobs:
           DISK_SRC=$(make -s print-node-image KUBE_MINOR=${{ matrix.kube-minor }})
           sudo podman save -o ${{ github.workspace }}/node-image.tar ${DISK_SRC}
 
+      # Arch-suffixed on both legs (including amd64, a rename from before this
+      # matrix gained an arch dimension) so downstream jobs pull a specific
+      # arch's artifact by an unambiguous name rather than relying on which
+      # leg happened to upload last.
       - name: Upload disk image artifact
         uses: actions/upload-artifact@v7
         with:
-          name: node-image-${{ matrix.kube-minor }}
+          name: node-image-${{ matrix.kube-minor }}-${{ matrix.arch }}
           path: node-image.tar
 
+      # bootc-image-builder has no user-facing way to force the composefs
+      # backend (see node-images/fedora/Makefile), so this variant stays on
+      # bcvk, which needs KVM and so stays amd64-only until that changes.
       - name: Build composefs disk image
+        if: matrix.arch == 'amd64'
         working-directory: node-images/fedora
         run: sudo make build-disk-image-composefs KUBE_MINOR=${{ matrix.kube-minor }}
 
       - name: Save composefs disk image
+        if: matrix.arch == 'amd64'
         working-directory: node-images/fedora
         run: |
           DISK_SRC=$(make -s print-node-image-composefs KUBE_MINOR=${{ matrix.kube-minor }})
           sudo podman save -o ${{ github.workspace }}/node-image-composefs.tar ${DISK_SRC}
 
       - name: Upload composefs disk image artifact
+        if: matrix.arch == 'amd64'
         uses: actions/upload-artifact@v7
         with:
           name: node-image-composefs-${{ matrix.kube-minor }}
@@ -191,7 +214,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: build-logs-${{ matrix.kube-minor }}
+          name: build-logs-${{ matrix.kube-minor }}-${{ matrix.arch }}
           path: /tmp/bink-logs/
 
   integration-tests:
@@ -209,7 +232,10 @@ jobs:
         if: needs.build-node-images.result == 'success'
         uses: actions/download-artifact@v8
         with:
-          name: node-image-${{ needs.supported-versions.outputs.default-version }}
+          # This job still only boot-tests amd64; arm64 disk images are
+          # built above but not yet exercised here (needs KVM, which
+          # ubuntu-24.04-arm doesn't have).
+          name: node-image-${{ needs.supported-versions.outputs.default-version }}-amd64
 
       - name: Load node image
         if: needs.build-node-images.result == 'success'
@@ -316,7 +342,8 @@ jobs:
         if: needs.build-node-images.result == 'success'
         uses: actions/download-artifact@v8
         with:
-          name: node-image-${{ matrix.kube-minor }}
+          # This job still only boot-tests amd64; see build-node-images.
+          name: node-image-${{ matrix.kube-minor }}-amd64
 
       - name: Load node image
         if: needs.build-node-images.result == 'success'
@@ -379,7 +406,10 @@ jobs:
       - name: Download disk image artifact
         uses: actions/download-artifact@v8
         with:
-          name: node-image-${{ matrix.kube-minor }}
+          # Publishing still only covers amd64; arm64 disk images are built
+          # in CI but not yet published as part of a multi-arch manifest --
+          # left as an open question in the PR description.
+          name: node-image-${{ matrix.kube-minor }}-amd64
 
       - name: Download composefs disk image artifact
         uses: actions/download-artifact@v8
@@ -396,7 +426,9 @@ jobs:
         working-directory: node-images/fedora
         run: |
           TAG=$(make -s print-image-tag KUBE_MINOR=${{ matrix.kube-minor }})
-          STAGING_TAG=${{ needs.supported-versions.outputs.branch-tag }}-${TAG}
+          # -amd64 matches build-node-images' staging tag: this job only
+          # ever consumes the amd64 leg (see the artifact download above).
+          STAGING_TAG=${{ needs.supported-versions.outputs.branch-tag }}-${TAG}-amd64
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "staging-tag=${STAGING_TAG}" >> "$GITHUB_OUTPUT"
 
